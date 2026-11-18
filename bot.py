@@ -1,6 +1,7 @@
 import os
 import re
 import asyncio
+import hashlib
 import subprocess
 import requests
 from aiohttp import web
@@ -36,7 +37,7 @@ async def start_healthcheck_server():
         return web.json_response({
             "status": "healthy",
             "bot": "NgunduhMantuh_bot",
-            "message": "Bot TikTok Downloader is running"
+            "message": "Bot TikTok & Facebook Downloader is running"
         })
 
     app = web.Application()
@@ -154,9 +155,9 @@ def fetch_tiktok_media_info(url):
     return None
 
 
-def download_binary(url, dest_path):
+def download_binary(url, dest_path, referer="https://www.tiktok.com/"):
     """Mendownload file binary ke path lokal."""
-    headers = {**DEFAULT_HEADERS, "Referer": "https://www.tiktok.com/"}
+    headers = {**DEFAULT_HEADERS, "Referer": referer}
     r = requests.get(url, headers=headers, stream=True, timeout=60)
     if r.status_code != 200:
         return False
@@ -204,29 +205,214 @@ def generate_thumbnail(video_path):
 
 
 # ==========================================
+# HELPER FACEBOOK / REELS (getmyfb.com)
+# ==========================================
+FACEBOOK_URL_PATTERN = r'https?://(?:[a-zA-Z0-9_-]+\.)*(?:facebook\.com|fb\.watch|fb\.me)/\S+'
+# Cuma url yang kelihatan video/reel — biar link profil/foto nggak bikin bot nyahut
+FACEBOOK_MEDIA_HINTS = (
+    '/reel/', '/reels/', '/share/', '/videos/', '/video.php', '/watch', '/v/',
+    'fb.watch/', 'fb.me/',
+)
+GETMYFB_URL = "https://getmyfb.com/process"
+GETMYFB_HEADERS = {
+    **DEFAULT_HEADERS,
+    "Accept": "*/*",
+    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    "HX-Request": "true",
+    "HX-Target": "target",
+    "HX-Current-URL": "https://getmyfb.com/",
+    "Origin": "https://getmyfb.com",
+    "Referer": "https://getmyfb.com/",
+}
+
+
+def is_facebook_media_url(url):
+    """True kalau URL Facebook kelihatan video/reel (bukan link profil/foto)."""
+    lowered = url.lower()
+    return any(hint in lowered for hint in FACEBOOK_MEDIA_HINTS)
+
+
+def extract_facebook_media_id(url):
+    """Ambil ID postingan Facebook dari URL (reel, video, atau share link)."""
+    for pattern in (r'/(?:reel|videos?)/(\d{6,})', r'[?&]v=(\d{6,})', r'/share/r/([A-Za-z0-9_-]+)'):
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return hashlib.md5(url.split('?')[0].encode()).hexdigest()[:12]
+
+
+def parse_getmyfb_html(html):
+    """Ambil link download (HD/SD) dari HTML hasil getmyfb.com."""
+    links = {}
+    for block in re.findall(r'<li class="results-list-item">(.*?)</li>', html, re.S):
+        label = re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', block)).strip().lower()
+        href = re.search(r'href=["\']([^"\']+)["\']', block)
+        if not href:
+            continue
+        if label.startswith('720') or '(hd)' in label:
+            links.setdefault('hd', href.group(1))
+        elif label.startswith('360') or '(sd)' in label:
+            links.setdefault('sd', href.group(1))
+    thumb = re.search(r'<img class="results-item-image"\s+src=["\']([^"\']+)["\']', html)
+    return links, (thumb.group(1) if thumb else None)
+
+
+def fetch_facebook_media_info(url):
+    """Scrape getmyfb.com untuk dapat link video HD/SD. Return None kalau gagal."""
+    media_id = extract_facebook_media_id(url)
+    session = requests.Session()
+    session.headers.update(DEFAULT_HEADERS)
+    for _ in range(2):
+        try:
+            session.get("https://getmyfb.com/", timeout=15)
+            res = session.post(
+                GETMYFB_URL,
+                data={"id": url, "locale": "en"},
+                headers=GETMYFB_HEADERS,
+                timeout=30
+            )
+            links, thumb_url = parse_getmyfb_html(res.text)
+            if links.get('hd') or links.get('sd'):
+                return {
+                    "id": media_id,
+                    "type": "video",
+                    "play": links.get('hd') or links.get('sd'),
+                    "quality": "HD" if links.get('hd') else "SD",
+                    "thumb_url": thumb_url,
+                }
+            # Server kasih sinyal lewat header hx-trigger kalau link gagal/privat
+            trigger = (res.headers.get("hx-trigger") or "").lower()
+            if "private" in trigger:
+                return {"error": "private"}
+            if "fail" in trigger:
+                return {"error": "fail"}
+        except requests.RequestException:
+            pass
+    return None
+
+
+# ==========================================
 # TELEGRAM BOT HANDLERS
 # ==========================================
 
-@client.on(events.NewMessage(pattern=r'^/start'))
+@client.on(events.NewMessage(pattern=r'^/(start|help)'))
 async def start_handler(event):
     welcome_text = (
-        "👋 **Selamat datang di TikTok Downloader Bot!**\n\n"
-        "Kirimkan link postingan TikTok (Video atau Foto Carousel) ke sini, "
+        "👋 **Selamat datang di TikTok & Facebook Downloader Bot!**\n\n"
+        "Kirimkan link TikTok atau Facebook/Reels ke sini, "
         "dan saya akan mengunduh serta mengirimkannya tanpa watermark.\n\n"
         "📌 **Format yang didukung:**\n"
         "• `https://vt.tiktok.com/...`\n"
         "• `https://www.tiktok.com/@user/video/...`\n"
-        "• `https://www.tiktok.com/@user/photo/...`\n\n"
-        "_Silakan tempel (paste) link TikTok Anda sekarang!_"
+        "• `https://www.tiktok.com/@user/photo/...`\n"
+        "• `https://www.facebook.com/reel/...`\n"
+        "• `https://www.facebook.com/share/r/...`\n"
+        "• `https://fb.watch/...`\n\n"
+        "_Silakan tempel (paste) link-nya sekarang!_"
     )
     await event.reply(welcome_text)
+
+
+async def handle_facebook_message(event, status_msg, fb_url):
+    """Download video Facebook/Reels via getmyfb.com lalu kirim ke Telegram."""
+    created_files = []
+    try:
+        data = await asyncio.to_thread(fetch_facebook_media_info, fb_url)
+
+        if not data:
+            await status_msg.edit(
+                "❌ **Gagal mengambil media dari link Facebook tersebut.**\n"
+                "Pastikan postingan bersifat publik dan link masih aktif."
+            )
+            return
+
+        if data.get("error") == "private":
+            await status_msg.edit(
+                "🔒 **Video ini privat / tidak bisa diakses publik.**\n"
+                "Coba link dari postingan yang publik ya."
+            )
+            return
+
+        if data.get("error"):
+            await status_msg.edit(
+                "❌ **getmyfb.com gagal memproses link ini.**\n"
+                "Coba lagi beberapa saat atau pakai link video yang lain."
+            )
+            return
+
+        media_id = data.get("id", "fb")
+        quality = data.get("quality", "HD")
+
+        await status_msg.edit(f"⬇ **Sedang mendownload video ({quality})...**")
+        video_path = os.path.join(TEMP_DIR, f"fb_{media_id}_{event.id}.mp4")
+        created_files.append(video_path)
+
+        ok = await asyncio.to_thread(download_binary, data["play"], video_path, "https://getmyfb.com/")
+        if not ok or not os.path.exists(video_path) or os.path.getsize(video_path) == 0:
+            await status_msg.edit("❌ **Gagal mendownload file video dari server.**")
+            return
+
+        await status_msg.edit("⬆ **Sedang mengunggah video ke Telegram...**")
+
+        duration, width, height = await asyncio.to_thread(get_video_metadata, video_path)
+        thumb_path = await asyncio.to_thread(generate_thumbnail, video_path)
+        if thumb_path:
+            created_files.append(thumb_path)
+
+        attributes = []
+        if duration or width or height:
+            attributes.append(DocumentAttributeVideo(
+                duration=duration,
+                w=width,
+                h=height,
+                supports_streaming=True
+            ))
+
+        caption = (
+            f"🎬 **Facebook Video** ({quality})\n"
+            f"🔗 [Link Facebook]({fb_url})"
+        )
+
+        await client.send_file(
+            event.chat_id,
+            file=video_path,
+            caption=caption,
+            thumb=thumb_path,
+            attributes=attributes,
+            reply_to=event.message.id
+        )
+        await status_msg.delete()
+
+    except Exception as e:
+        print(f"Error handling Facebook message: {e}")
+        try:
+            await status_msg.edit(f"❌ **Terjadi kesalahan:** {e}")
+        except Exception:
+            pass
+
+    finally:
+        for fpath in created_files:
+            if os.path.exists(fpath):
+                try:
+                    os.remove(fpath)
+                except Exception:
+                    pass
 
 
 @client.on(events.NewMessage)
 async def message_handler(event):
     text = event.raw_text.strip()
-    if text.startswith("/start"):
+    if text.startswith("/"):
         return
+
+    # Link Facebook / Reels
+    fb_match = re.search(FACEBOOK_URL_PATTERN, text)
+    if fb_match:
+        fb_url = fb_match.group(0).rstrip('.,)')
+        if is_facebook_media_url(fb_url):
+            status_msg = await event.reply("⏳ **Sedang memproses link Facebook...**")
+            await handle_facebook_message(event, status_msg, fb_url)
+            return
 
     # Cari URL TikTok di dalam pesan
     pattern = r'https?://(?:(?:[a-zA-Z0-9_-]+\.)?tiktok\.com)/\S+'
@@ -361,13 +547,13 @@ async def start_bot():
 
     me = await client.get_me()
     print("=" * 45)
-    print("🤖 TIKTOK DOWNLOADER TELEGRAM BOT")
+    print("🤖 TIKTOK & FACEBOOK DOWNLOADER TELEGRAM BOT")
     print(f"✅ Bot Berhasil Berjalan!")
     print(f"   Nama    : {me.first_name}")
     print(f"   Username: @{me.username}")
     print(f"   Bot ID  : {me.id}")
     print("=" * 45)
-    print("Menunggu pesan link TikTok... (Ctrl+C untuk stop)")
+    print("Menunggu pesan link TikTok / Facebook... (Ctrl+C untuk stop)")
 
     await client.run_until_disconnected()
 
