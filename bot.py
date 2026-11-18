@@ -4,6 +4,11 @@ import asyncio
 import hashlib
 import subprocess
 import requests
+
+try:
+    import yt_dlp
+except ImportError:  # jalur cadangan Facebook; bot tetap jalan tanpa ini
+    yt_dlp = None
 from aiohttp import web
 from telethon import TelegramClient, events
 from telethon.tl.types import DocumentAttributeVideo
@@ -262,7 +267,7 @@ def fetch_facebook_media_info(url):
     media_id = extract_facebook_media_id(url)
     session = requests.Session()
     session.headers.update(DEFAULT_HEADERS)
-    for _ in range(2):
+    for attempt in range(2):
         try:
             session.get("https://getmyfb.com/", timeout=15)
             res = session.post(
@@ -282,12 +287,53 @@ def fetch_facebook_media_info(url):
                 }
             # Server kasih sinyal lewat header hx-trigger kalau link gagal/privat
             trigger = (res.headers.get("hx-trigger") or "").lower()
+            snippet = re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', res.text)).strip()[:160]
+            print(f"getmyfb gagal (percobaan {attempt + 1}): status={res.status_code} "
+                  f"trigger={trigger or '-'} body='{snippet}'")
             if "private" in trigger:
                 return {"error": "private"}
             if "fail" in trigger:
                 return {"error": "fail"}
-        except requests.RequestException:
-            pass
+        except requests.RequestException as e:
+            print(f"getmyfb error (percobaan {attempt + 1}): {e}")
+    return None
+
+
+def download_facebook_via_ytdlp(url, dest_dir, base_name):
+    """Jalur cadangan: download langsung dari facebook.com pakai yt-dlp."""
+    if yt_dlp is None:
+        print("yt-dlp nggak terpasang, jalur cadangan dilewati")
+        return None
+
+    opts = {
+        "format": "hd/bv*+ba/b",
+        "format_sort": ["res:1080"],
+        "outtmpl": os.path.join(dest_dir, base_name + ".%(ext)s"),
+        "merge_output_format": "mp4",
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "nocheckcertificate": True,
+        "retries": 2,
+        "socket_timeout": 30,
+    }
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            path = ydl.prepare_filename(info)
+            if not os.path.exists(path):
+                # setelah merge, ekstensinya bisa berubah
+                base = os.path.splitext(path)[0]
+                for ext in ('.mp4', '.mkv', '.webm'):
+                    if os.path.exists(base + ext):
+                        path = base + ext
+                        break
+            if os.path.exists(path):
+                print(f"yt-dlp ok: {os.path.basename(path)} ({info.get('height')}p)")
+                return path, info.get("height")
+            print(f"yt-dlp selesai tapi file nggak ketemu: {path}")
+    except Exception as e:
+        print(f"yt-dlp gagal: {e}")
     return None
 
 
@@ -314,47 +360,57 @@ async def start_handler(event):
 
 
 async def handle_facebook_message(event, status_msg, fb_url):
-    """Download video Facebook/Reels via getmyfb.com lalu kirim ke Telegram."""
+    """Download video Facebook/Reels: getmyfb.com dulu, yt-dlp kalau diblok."""
     created_files = []
+    quality = "HD"
     try:
+        media_id = extract_facebook_media_id(fb_url)
+        video_path = None
+
         data = await asyncio.to_thread(fetch_facebook_media_info, fb_url)
 
-        if not data:
-            await status_msg.edit(
-                "❌ **Gagal mengambil media dari link Facebook tersebut.**\n"
-                "Pastikan postingan bersifat publik dan link masih aktif."
-            )
-            return
-
-        if data.get("error") == "private":
+        if data and data.get("error") == "private":
             await status_msg.edit(
                 "🔒 **Video ini privat / tidak bisa diakses publik.**\n"
                 "Coba link dari postingan yang publik ya."
             )
             return
 
-        if data.get("error"):
-            await status_msg.edit(
-                "❌ **getmyfb.com gagal memproses link ini.**\n"
-                "Coba lagi beberapa saat atau pakai link video yang lain."
+        # Jalur 1: link langsung hasil scrape getmyfb.com
+        if data and data.get("play"):
+            quality = data.get("quality", "HD")
+            await status_msg.edit(f"⬇ **Sedang mendownload video ({quality})...**")
+            video_path = os.path.join(TEMP_DIR, f"fb_{media_id}_{event.id}.mp4")
+            created_files.append(video_path)
+            ok = await asyncio.to_thread(download_binary, data["play"], video_path, "https://getmyfb.com/")
+            if not ok or not os.path.exists(video_path) or os.path.getsize(video_path) == 0:
+                print("Download dari link getmyfb gagal, pindah ke yt-dlp")
+                video_path = None
+
+        # Jalur 2: yt-dlp, download langsung dari facebook.com
+        if not video_path:
+            await status_msg.edit("🔁 **Sumber pertama nggak bisa dipakai, coba jalur cadangan...**")
+            result = await asyncio.to_thread(
+                download_facebook_via_ytdlp, fb_url, TEMP_DIR, f"fb_{media_id}_{event.id}"
             )
-            return
+            if result:
+                video_path, height = result
+                created_files.append(video_path)
+                quality = f"{height}p" if height else "HD"
 
-        media_id = data.get("id", "fb")
-        quality = data.get("quality", "HD")
-
-        await status_msg.edit(f"⬇ **Sedang mendownload video ({quality})...**")
-        video_path = os.path.join(TEMP_DIR, f"fb_{media_id}_{event.id}.mp4")
-        created_files.append(video_path)
-
-        ok = await asyncio.to_thread(download_binary, data["play"], video_path, "https://getmyfb.com/")
-        if not ok or not os.path.exists(video_path) or os.path.getsize(video_path) == 0:
-            await status_msg.edit("❌ **Gagal mendownload file video dari server.**")
+        if not video_path:
+            await status_msg.edit(
+                "❌ **Gagal mengambil media dari link Facebook tersebut.**\n"
+                "Pastikan postingan bersifat publik dan link masih aktif."
+            )
             return
 
         await status_msg.edit("⬆ **Sedang mengunggah video ke Telegram...**")
 
         duration, width, height = await asyncio.to_thread(get_video_metadata, video_path)
+        if width and height:
+            # video vertikal (reels) -> kualitas pakai sisi pendek, misal 720p
+            quality = f"{min(width, height)}p"
         thumb_path = await asyncio.to_thread(generate_thumbnail, video_path)
         if thumb_path:
             created_files.append(thumb_path)
