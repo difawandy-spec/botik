@@ -1,11 +1,14 @@
 import os
 import re
 import html
+import json
 import time
+import base64
 import asyncio
 import hashlib
 import subprocess
 import requests
+from http.cookiejar import MozillaCookieJar
 
 try:
     import yt_dlp
@@ -31,6 +34,40 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
+
+# Facebook ngasih halaman versi ringan (og:image) ke UA bot, sering lolos login wall
+FACEBOOK_BOT_UA = "TelegramBot (like TwitterBot)"
+# Opsional: proxy buat request ke facebook.com, misal "http://user:pass@host:port"
+FB_PROXY = os.getenv("FB_PROXY", "").strip()
+# Cookie Netscape export dari browser (biar Facebook nggak anggap kita bot / login wall).
+# Bisa dari file (FB_COOKIE_FILE / fb_cookies.txt) atau base64 di env (FB_COOKIES_B64).
+FB_COOKIE_FILE = os.getenv("FB_COOKIE_FILE", "").strip()
+FB_COOKIES_B64 = os.getenv("FB_COOKIES_B64", "").strip()
+
+
+def get_facebook_cookie_file():
+    """Path file cookie Netscape buat facebook.com, atau None kalau nggak ada."""
+    if FB_COOKIES_B64:
+        target = os.path.join(TEMP_DIR, "fb_cookies.txt")
+        if not os.path.exists(target):
+            try:
+                with open(target, "wb") as f:
+                    f.write(base64.b64decode(FB_COOKIES_B64))
+                os.chmod(target, 0o600)
+            except Exception as e:
+                print(f"FB_COOKIES_B64 gagal dipakai: {e}")
+                return None
+        return target
+
+    candidates = [FB_COOKIE_FILE] if FB_COOKIE_FILE else []
+    candidates += [
+        os.path.join(BASE_DIR, "fb_cookies.txt"),
+        os.path.join(BASE_DIR, "www.facebook.com_cookies.txt"),
+    ]
+    for path in candidates:
+        if path and os.path.exists(path):
+            return path
+    return None
 
 client = TelegramClient(os.path.join(BASE_DIR, "bot_session"), API_ID, API_HASH)
 
@@ -335,6 +372,9 @@ def download_facebook_via_ytdlp(url, dest_dir, base_name):
         "retries": 2,
         "socket_timeout": 30,
     }
+    cookie_file = get_facebook_cookie_file()
+    if cookie_file:
+        opts["cookiefile"] = cookie_file
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
@@ -366,57 +406,168 @@ FACEBOOK_PAGE_HEADERS = {
 }
 
 
-def fetch_facebook_photos(url, limit=10):
-    """Scrape halaman post Facebook buat ambil foto asli (termasuk carousel)."""
+def _fb_get_page(url, headers, tries=2):
+    """GET halaman Facebook pakai header tertentu. Return HTML atau None."""
     session = requests.Session()
-    session.headers.update(FACEBOOK_PAGE_HEADERS)
+    session.headers.update(headers)
+    if FB_PROXY:
+        session.proxies = {"http": FB_PROXY, "https": FB_PROXY}
+    cookie_file = get_facebook_cookie_file()
+    if cookie_file:
+        jar = MozillaCookieJar(cookie_file)
+        try:
+            jar.load(ignore_discard=True, ignore_expires=True)
+            session.cookies.update(jar)
+        except Exception as e:
+            print(f"cookie facebook gagal dimuat: {e}")
     try:
         session.get("https://www.facebook.com/", timeout=20)  # ambil cookie dulu
     except requests.RequestException:
         pass  # cookie cuma pelengkap, lanjut aja
 
-    page = None
-    for attempt in range(3):
+    for attempt in range(tries):
         try:
             res = session.get(url, timeout=30, allow_redirects=True)
-            if res.status_code == 200 and len(res.text) >= 5000:
-                page = res.text
-                break
-            print(f"facebook page ditolak: status={res.status_code} bytes={len(res.text)} "
-                  f"(kemungkinan login wall / blokir IP)")
+            body = res.text
+            if res.status_code == 200 and len(body) >= 5000:
+                return body
+            lowered = body[:200000].lower()
+            if "isn't available" in lowered or "is not available" in lowered:
+                print("facebook: postingan nggak tersedia (privat / sudah dihapus)")
+                return None
+            hint = ""
+            if cookie_file and "log" in lowered[:2000]:
+                hint = " — cookie mungkin expired, export ulang"
+            print(f"facebook page ditolak: status={res.status_code} bytes={len(body)} "
+                  f"(kemungkinan login wall / blokir IP){hint}")
             if res.status_code in (404, 410):
-                return []
+                return None
         except requests.RequestException as e:
             print(f"facebook page error (percobaan {attempt + 1}): {e}")
         time.sleep(2)
+    return None
 
-    if not page:
+
+def find_facebook_post_id(page, url):
+    """Cari ID numerik postingan dari halaman / URL."""
+    ids = re.findall(r'story_fbid=(\d{8,})', page)
+    og = re.search(r'property="og:url"[^>]*content="([^"]*)"', page)
+    if og:
+        ids += re.findall(r'\d{8,}', html.unescape(og.group(1)))
+    ids += re.findall(r'\d{8,}', url or '')
+    unique = []
+    for pid in ids:
+        if pid not in unique:
+            unique.append(pid)
+    return unique
+
+
+def _find_story_object(node, post_id):
+    """Cari object JSON yang punya post_id + attachments (data postingan)."""
+    if isinstance(node, dict):
+        value = node.get('post_id') or node.get('story_fbid')
+        if str(value) == post_id and isinstance(node.get('attachments'), list):
+            return node
+        for child in node.values():
+            if isinstance(child, (dict, list)):
+                found = _find_story_object(child, post_id)
+                if found is not None:
+                    return found
+    elif isinstance(node, list):
+        for child in node:
+            found = _find_story_object(child, post_id)
+            if found is not None:
+                return found
+    return None
+
+
+def _photos_from_attachments(attachments):
+    """Ambil URL foto dari struktur attachments Facebook."""
+    uris = []
+    for att in attachments:
+        if not isinstance(att, dict):
+            continue
+        style = ((att.get('styles') or {}).get('attachment') or {})
+        nodes = ((style.get('all_subattachments') or {}).get('nodes')) or []
+        if nodes:
+            for node in nodes:
+                media = (node or {}).get('media') or {}
+                uri = (media.get('image') or {}).get('uri')
+                if isinstance(uri, str) and 'scontent' in uri:
+                    uris.append(uri)
+        else:
+            media = att.get('media') or style.get('media') or {}
+            uri = (media.get('image') or {}).get('uri')
+            if isinstance(uri, str) and 'scontent' in uri:
+                uris.append(uri)
+    return uris
+
+
+def signed_out_page(page):
+    """True kalau yang balik ternyata halaman login Facebook (cookie expired)."""
+    lowered = page[:300000].lower()
+    return 'log into facebook' in lowered and 'name="email"' in lowered
+
+
+def _parse_facebook_photos(page, url=None, limit=10):
+    """Ambil URL foto milik postingan (bukan gambar lain yang nempel di halaman)."""
+    ids = find_facebook_post_id(page, url)
+    blobs = re.findall(r'<script type="application/json"[^>]*>(.*?)</script>', page, re.S)
+    for post_id in ids:
+        for blob in blobs:
+            if post_id not in blob:
+                continue
+            try:
+                data = json.loads(blob)
+            except ValueError:
+                continue
+            story = _find_story_object(data, post_id)
+            if story is None:
+                continue
+            uris = _photos_from_attachments(story['attachments'])
+            if not uris:
+                continue
+            unique, seen = [], set()
+            for uri in uris:
+                key = re.search(r'/(\d+_\d+_\d+)_n\.jpg', uri)
+                marker = key.group(1) if key else uri
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                # buang parameter ctp -> dapat ukuran asli, bukan versi kecil
+                unique.append(re.sub(r'[&?]ctp=[^&]*', '', uri))
+            return unique[:limit]
+
+    # postingan nggak ada di halaman (login wall / sudah dihapus) -> jangan asal ambil og:image
+    if ids and not any(pid in page for pid in ids):
+        print("facebook: id postingan nggak ketemu di halaman (login wall / post nggak tersedia)")
         return []
 
-    photos = []
+    # cadangan: foto pertama dari og:image (aman, nggak ikut gambar lain)
+    if signed_out_page(page):
+        return []
     og = re.search(r'property="og:image"[^>]*content="([^"]*)"', page)
     if og:
-        photos.append(html.unescape(og.group(1)))
+        return [re.sub(r'[&?]ctp=[^&]*', '', html.unescape(og.group(1)))]
+    return []
 
-    # foto resolusi besar di halaman (carousel)
-    for raw in re.findall(r'https://scontent[^"\\ ]+?\.jpg[^"\\ ]*', page):
-        candidate = html.unescape(raw).replace('\\/', '/')
-        if '/t39.30808-6/' in candidate:
-            photos.append(candidate)
 
-    unique = []
-    seen = set()
-    for photo in photos:
-        key = re.search(r'/(\d+_\d+_\d+)_n\.jpg', photo)
-        marker = key.group(1) if key else photo
-        if marker in seen:
-            continue
-        seen.add(marker)
-        # buang parameter ctp -> dapat ukuran asli, bukan versi kecil (332x590)
-        unique.append(re.sub(r'[&?]ctp=[^&]*', '', photo))
+def fetch_facebook_photos(url, limit=10):
+    """Scrape halaman post Facebook buat ambil foto asli (termasuk carousel)."""
+    # Jalur 1: header browser lengkap (pakai cookie kalau ada) -> carousel lengkap
+    page = _fb_get_page(url, FACEBOOK_PAGE_HEADERS)
+    photos = _parse_facebook_photos(page, url, limit) if page else []
+    print(f"facebook foto ketemu: {len(photos)}")
 
-    print(f"facebook foto ketemu: {len(unique)}")
-    return unique[:limit]
+    # Jalur 2: UA bot. Facebook kasih versi ringan yang lolos dari login wall
+    # (biasanya cuma foto pertama, tapi lumayan daripada gagal total di IP datacenter)
+    if not photos:
+        bot_headers = {**DEFAULT_HEADERS, "User-Agent": FACEBOOK_BOT_UA}
+        page = _fb_get_page(url, bot_headers)
+        photos = _parse_facebook_photos(page, url, limit) if page else []
+        print(f"facebook foto via UA bot: {len(photos)}")
+
+    return photos
 
 
 # ==========================================
@@ -737,6 +888,8 @@ async def start_bot():
     print(f"   Nama    : {me.first_name}")
     print(f"   Username: @{me.username}")
     print(f"   Bot ID  : {me.id}")
+    cookie_file = get_facebook_cookie_file()
+    print(f"   Cookie FB: {'ada (' + os.path.basename(cookie_file) + ')' if cookie_file else 'nggak ada'}")
     print("=" * 45)
     print("Menunggu pesan link TikTok / Facebook... (Ctrl+C untuk stop)")
 

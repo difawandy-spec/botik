@@ -8,7 +8,7 @@ Bot Telegram buat ngunduh video/foto TikTok sama video Facebook/Reels, terus dik
 |---|---|---|
 | TikTok | Video tanpa watermark, foto/carousel | scrape endpoint web TikTok (`fetch_tiktok_media_info`) |
 | Facebook | Reels, video, link share (`/share/r/...`, `/share/v/...`), `fb.watch` | scrape [getmyfb.com](https://getmyfb.com) → link `ssscdn.io` (HD 720p, fallback SD 360p); kalau getmyfb diblok (sering di IP datacenter), otomatis fallback ke **yt-dlp** |
-| Facebook foto | Postingan foto tunggal & carousel (`/share/p/...`) | getmyfb cuma kasih placeholder, jadi foto diambil langsung dari HTML postingan (og:image + semua `scontent.../t39.30808-6/`, param `ctp` dibuang biar resolusi asli) |
+| Facebook foto | Postingan foto tunggal & carousel (`/share/p/...`) | getmyfb cuma kasih placeholder, jadi foto diambil langsung dari HTML postingan (og:image + semua `scontent.../t39.30808-6/`, param `ctp` dibuang biar resolusi asli). Kalau FB ngeblok IP server, fallback ke UA bot (`TelegramBot (like TwitterBot)`) yang biasanya lolos login wall — dapatnya foto pertama saja |
 
 - Deteksi link otomatis dari teks pesan (boleh ada teks lain di sekitarnya).
 - Link profil Facebook diabaikan biar bot nggak nyahut di grup.
@@ -31,6 +31,9 @@ requirements.txt  # requests, tqdm, pymediainfo, telethon, aiohttp
 | `API_ID` | ya | — |
 | `API_HASH` | ya | — |
 | `PORT` | tidak | `8000` |
+| `FB_PROXY` | tidak | — (proxy `http://user:pass@host:port` khusus request ke facebook.com, kalau IP server diblok) |
+| `FB_COOKIE_FILE` | tidak | path cookie Netscape kalau nggak mau taruh di folder bot |
+| `FB_COOKIES_B64` | tidak | isi file cookie yang di-base64 (dipakai kalau deploy di server, misal Railway) |
 
 Jangan commit nilai aslinya. Kalau jalan di Koyeb, isi lewat tab **Environment**.
 
@@ -71,6 +74,23 @@ railway up
 Di dashboard Railway: **Variables** → `BOT_TOKEN`, `API_ID`, `API_HASH`; **Settings → Networking → Generate Domain** dengan target port `8000`. Railway nyuntik env `PORT` sendiri dan bot sudah baca variabel itu.
 
 Soal biaya: plan **Free** cuma kasih $1 kredit/bulan (RAM maks 0.5 GB per service). Bot yang nyala 24 jam bakal habis kredit dalam beberapa hari, jadi praktis butuh plan **Hobby $5/bulan**. Untuk bot always-on, Koyeb free lebih hemat.
+
+## Cookie Facebook (perlu buat foto dari server)
+
+Postingan foto diambil dengan membaca HTML post. Dari IP datacenter (Railway/VPS) Facebook sering balas login wall, jadi bot butuh cookie sesi login:
+
+1. Login facebook.com di browser, pasang ekstensi "Get cookies.txt LOCALLY", export cookie domain facebook.com → dapat `www.facebook.com_cookies.txt`.
+2. Lokal: taruh file itu di folder ini (nama `www.facebook.com_cookies.txt` atau `fb_cookies.txt`), atau set `FB_COOKIE_FILE`.
+3. Server (Railway/Koyeb):
+   ```bash
+   base64 -w0 www.facebook.com_cookies.txt > fb_cookies.b64.txt
+   ```
+   Copy isi `fb_cookies.b64.txt` ke env var `FB_COOKIES_B64`, lalu hapus file b64-nya.
+4. File cookie masuk `.gitignore` dan `.dockerignore` — jangan sampai ke-commit atau ke image.
+
+Cookie `c_user`/`xs` biasanya tahan ~1 tahun, tapi bisa mati kalau logout/ganti password. Kalau foto berhenti ke-load, cek log (`facebook page ditolak:` / `facebook foto via UA bot: 0`) lalu export ulang cookie-nya.
+
+Tanpa cookie bot tetap jalan: foto biasanya cuma dapat yang pertama (via UA bot), video tetap normal.
 
 ## Catatan perawatan
 

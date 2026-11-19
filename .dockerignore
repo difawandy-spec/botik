@@ -8,3 +8,7 @@ __pycache__/
 downloads/
 .git/
 .gitignore
+# cookie facebook jangan ikut ke image; di server pakai env FB_COOKIES_B64
+*cookies.txt
+fb_cookies.txt
+fb_cookies.b64.txt

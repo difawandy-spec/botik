@@ -5,3 +5,7 @@ __pycache__/
 downloads/
 .env
 .venv/
+# cookie facebook itu kredensial — jangan sampai ke-commit
+*cookies.txt
+fb_cookies.txt
+fb_cookies.b64.txt
