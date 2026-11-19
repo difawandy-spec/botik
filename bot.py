@@ -1,5 +1,7 @@
 import os
 import re
+import html
+import time
 import asyncio
 import hashlib
 import subprocess
@@ -161,16 +163,23 @@ def fetch_tiktok_media_info(url):
 
 
 def download_binary(url, dest_path, referer="https://www.tiktok.com/"):
-    """Mendownload file binary ke path lokal."""
+    """Mendownload file binary ke path lokal (retry kalau koneksi direset)."""
     headers = {**DEFAULT_HEADERS, "Referer": referer}
-    r = requests.get(url, headers=headers, stream=True, timeout=60)
-    if r.status_code != 200:
-        return False
-    with open(dest_path, "wb") as f:
-        for chunk in r.iter_content(chunk_size=128 * 1024):
-            if chunk:
-                f.write(chunk)
-    return True
+    for attempt in range(3):
+        try:
+            r = requests.get(url, headers=headers, stream=True, timeout=60)
+            if r.status_code != 200:
+                print(f"download status {r.status_code} (percobaan {attempt + 1})")
+                return False
+            with open(dest_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=128 * 1024):
+                    if chunk:
+                        f.write(chunk)
+            return True
+        except requests.RequestException as e:
+            print(f"download error (percobaan {attempt + 1}): {e}")
+            time.sleep(2)
+    return False
 
 
 def get_video_metadata(file_path):
@@ -246,10 +255,11 @@ def extract_facebook_media_id(url):
     return hashlib.md5(url.split('?')[0].encode()).hexdigest()[:12]
 
 
-def parse_getmyfb_html(html):
-    """Ambil link download (HD/SD) dari HTML hasil getmyfb.com."""
+def parse_getmyfb_html(page):
+    """Ambil link download dari HTML hasil getmyfb.com: video (HD/SD) atau foto."""
     links = {}
-    for block in re.findall(r'<li class="results-list-item">(.*?)</li>', html, re.S):
+    has_photo = False
+    for block in re.findall(r'<li class="results-list-item">(.*?)</li>', page, re.S):
         label = re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', block)).strip().lower()
         href = re.search(r'href=["\']([^"\']+)["\']', block)
         if not href:
@@ -258,8 +268,10 @@ def parse_getmyfb_html(html):
             links.setdefault('hd', href.group(1))
         elif label.startswith('360') or '(sd)' in label:
             links.setdefault('sd', href.group(1))
-    thumb = re.search(r'<img class="results-item-image"\s+src=["\']([^"\']+)["\']', html)
-    return links, (thumb.group(1) if thumb else None)
+        elif 'photo' in label or 'foto' in label:
+            has_photo = True  # link foto getmyfb cuma placeholder kecil, kita scrape sendiri
+    thumb = re.search(r'<img class="results-item-image"\s+src=["\']([^"\']+)["\']', page)
+    return links, (thumb.group(1) if thumb else None), has_photo
 
 
 def fetch_facebook_media_info(url):
@@ -267,7 +279,7 @@ def fetch_facebook_media_info(url):
     media_id = extract_facebook_media_id(url)
     session = requests.Session()
     session.headers.update(DEFAULT_HEADERS)
-    for attempt in range(2):
+    for attempt in range(3):
         try:
             session.get("https://getmyfb.com/", timeout=15)
             res = session.post(
@@ -276,7 +288,11 @@ def fetch_facebook_media_info(url):
                 headers=GETMYFB_HEADERS,
                 timeout=30
             )
-            links, thumb_url = parse_getmyfb_html(res.text)
+            if '"rate_limit"' in res.text:
+                print(f"getmyfb rate limit (percobaan {attempt + 1}), tunggu dulu")
+                time.sleep(4 * (attempt + 1))
+                continue
+            links, thumb_url, has_photo = parse_getmyfb_html(res.text)
             if links.get('hd') or links.get('sd'):
                 return {
                     "id": media_id,
@@ -285,6 +301,8 @@ def fetch_facebook_media_info(url):
                     "quality": "HD" if links.get('hd') else "SD",
                     "thumb_url": thumb_url,
                 }
+            if has_photo:
+                return {"id": media_id, "kind": "photo"}
             # Server kasih sinyal lewat header hx-trigger kalau link gagal/privat
             trigger = (res.headers.get("hx-trigger") or "").lower()
             snippet = re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', res.text)).strip()[:160]
@@ -337,6 +355,70 @@ def download_facebook_via_ytdlp(url, dest_dir, base_name):
     return None
 
 
+FACEBOOK_PAGE_HEADERS = {
+    **DEFAULT_HEADERS,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+
+def fetch_facebook_photos(url, limit=10):
+    """Scrape halaman post Facebook buat ambil foto asli (termasuk carousel)."""
+    session = requests.Session()
+    session.headers.update(FACEBOOK_PAGE_HEADERS)
+    try:
+        session.get("https://www.facebook.com/", timeout=20)  # ambil cookie dulu
+    except requests.RequestException:
+        pass  # cookie cuma pelengkap, lanjut aja
+
+    page = None
+    for attempt in range(3):
+        try:
+            res = session.get(url, timeout=30, allow_redirects=True)
+            if res.status_code == 200 and len(res.text) >= 5000:
+                page = res.text
+                break
+            print(f"facebook page ditolak: status={res.status_code} bytes={len(res.text)} "
+                  f"(kemungkinan login wall / blokir IP)")
+            if res.status_code in (404, 410):
+                return []
+        except requests.RequestException as e:
+            print(f"facebook page error (percobaan {attempt + 1}): {e}")
+        time.sleep(2)
+
+    if not page:
+        return []
+
+    photos = []
+    og = re.search(r'property="og:image"[^>]*content="([^"]*)"', page)
+    if og:
+        photos.append(html.unescape(og.group(1)))
+
+    # foto resolusi besar di halaman (carousel)
+    for raw in re.findall(r'https://scontent[^"\\ ]+?\.jpg[^"\\ ]*', page):
+        candidate = html.unescape(raw).replace('\\/', '/')
+        if '/t39.30808-6/' in candidate:
+            photos.append(candidate)
+
+    unique = []
+    seen = set()
+    for photo in photos:
+        key = re.search(r'/(\d+_\d+_\d+)_n\.jpg', photo)
+        marker = key.group(1) if key else photo
+        if marker in seen:
+            continue
+        seen.add(marker)
+        # buang parameter ctp -> dapat ukuran asli, bukan versi kecil (332x590)
+        unique.append(re.sub(r'[&?]ctp=[^&]*', '', photo))
+
+    print(f"facebook foto ketemu: {len(unique)}")
+    return unique[:limit]
+
+
 # ==========================================
 # TELEGRAM BOT HANDLERS
 # ==========================================
@@ -359,6 +441,40 @@ async def start_handler(event):
     await event.reply(welcome_text)
 
 
+async def send_facebook_photos(event, status_msg, fb_url, created_files):
+    """Ambil + kirim foto postingan Facebook (single/carousel). True kalau terkirim."""
+    await status_msg.edit("🖼 **Sedang memproses foto postingan...**")
+    photos = await asyncio.to_thread(fetch_facebook_photos, fb_url)
+    if not photos:
+        return False
+
+    await status_msg.edit(f"⬇ **Sedang mendownload {len(photos)} foto...**")
+    img_paths = []
+    for idx, photo_url in enumerate(photos, start=1):
+        img_path = os.path.join(TEMP_DIR, f"fb_photo_{event.id}_{idx}.jpg")
+        created_files.append(img_path)
+        ok = await asyncio.to_thread(download_binary, photo_url, img_path, "https://www.facebook.com/")
+        if ok and os.path.exists(img_path) and os.path.getsize(img_path) > 0:
+            img_paths.append(img_path)
+
+    if not img_paths:
+        return False
+
+    await status_msg.edit(f"⬆ **Mengunggah {len(img_paths)} foto ke Telegram...**")
+    caption = (
+        f"🖼 **Facebook Photo** ({len(img_paths)} foto)\n"
+        f"🔗 [Link Facebook]({fb_url})"
+    )
+    await client.send_file(
+        event.chat_id,
+        file=img_paths,
+        caption=caption,
+        reply_to=event.message.id
+    )
+    await status_msg.delete()
+    return True
+
+
 async def handle_facebook_message(event, status_msg, fb_url):
     """Download video Facebook/Reels: getmyfb.com dulu, yt-dlp kalau diblok."""
     created_files = []
@@ -366,6 +482,7 @@ async def handle_facebook_message(event, status_msg, fb_url):
     try:
         media_id = extract_facebook_media_id(fb_url)
         video_path = None
+        photos_tried = False
 
         data = await asyncio.to_thread(fetch_facebook_media_info, fb_url)
 
@@ -376,7 +493,13 @@ async def handle_facebook_message(event, status_msg, fb_url):
             )
             return
 
-        # Jalur 1: link langsung hasil scrape getmyfb.com
+        # Post foto: getmyfb nandain "Download Photo" -> kita scrape sendiri halamannya
+        if data and data.get("kind") == "photo":
+            photos_tried = True
+            if await send_facebook_photos(event, status_msg, fb_url, created_files):
+                return
+
+        # Jalur 1: video dari link langsung hasil scrape getmyfb.com
         if data and data.get("play"):
             quality = data.get("quality", "HD")
             await status_msg.edit(f"⬇ **Sedang mendownload video ({quality})...**")
@@ -398,10 +521,16 @@ async def handle_facebook_message(event, status_msg, fb_url):
                 created_files.append(video_path)
                 quality = f"{height}p" if height else "HD"
 
+        # Post foto yang nggak ketebak getmyfb (misal link /share/p/...)
+        if not video_path and not photos_tried and re.search(r'/(?:share/p|photos?)/', fb_url):
+            if await send_facebook_photos(event, status_msg, fb_url, created_files):
+                return
+
         if not video_path:
             await status_msg.edit(
                 "❌ **Gagal mengambil media dari link Facebook tersebut.**\n"
-                "Pastikan postingan bersifat publik dan link masih aktif."
+                "Pastikan postingan publik dan link masih aktif. Kalau postingan cuma "
+                "dibagikan ke grup/teman tertentu, Facebook nggak ngebolehin diunduh."
             )
             return
 
