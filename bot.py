@@ -81,7 +81,7 @@ async def start_healthcheck_server():
         return web.json_response({
             "status": "healthy",
             "bot": "NgunduhMantuh_bot",
-            "message": "Bot TikTok & Facebook Downloader is running"
+            "message": "Bot TikTok, Facebook & X Downloader is running"
         })
 
     app = web.Application()
@@ -571,14 +571,117 @@ def fetch_facebook_photos(url, limit=10):
 
 
 # ==========================================
+# HELPER X / TWITTER (api.fxtwitter.com)
+# ==========================================
+TWITTER_URL_PATTERN = r'https?://(?:www\.|mobile\.|m\.)?(?:twitter\.com|x\.com)/\S+'
+FXTWITTER_API = "https://api.fxtwitter.com/status/{tweet_id}"
+
+
+def extract_tweet_id(url):
+    """Ambil ID status dari URL Twitter/X. None kalau bukan link status."""
+    match = re.search(r'/(?:status|statuses)/(\d{5,})', url or '')
+    return match.group(1) if match else None
+
+
+def pick_best_twitter_variant(variants):
+    """Pilih MP4 bitrate tertinggi dari daftar variant."""
+    mp4s = [
+        v for v in (variants or [])
+        if isinstance(v, dict) and 'mp4' in str(v.get('content_type', ''))
+        and isinstance(v.get('url'), str)
+    ]
+    if not mp4s:
+        return None
+    return max(mp4s, key=lambda v: int(v.get('bitrate') or 0))
+
+
+def fetch_twitter_media_info(tweet_id):
+    """Ambil media tweet via fxtwitter. Return dict {'videos': [...], 'photos': [...]} atau error."""
+    payload = None
+    for attempt in range(2):
+        try:
+            res = requests.get(
+                FXTWITTER_API.format(tweet_id=tweet_id),
+                headers=DEFAULT_HEADERS,
+                timeout=30
+            )
+        except requests.RequestException as e:
+            print(f"fxtwitter error (percobaan {attempt + 1}): {e}")
+            time.sleep(2)
+            continue
+
+        if res.status_code == 404:
+            return {"error": "notfound"}
+        if res.status_code != 200:
+            print(f"fxtwitter status {res.status_code}: {res.text[:160]}")
+            time.sleep(2)
+            continue
+
+        try:
+            payload = res.json()
+        except ValueError:
+            print(f"fxtwitter balas bukan JSON: {res.text[:160]}")
+            time.sleep(2)
+            continue
+        break
+
+    if payload is None:
+        return None
+
+    tweet = payload.get("tweet") or {}
+    if not tweet:
+        return {"error": "notfound"}
+
+    media = tweet.get("media") or {}
+    videos = []
+    for video in media.get("videos") or []:
+        if video.get("type") == "gif":
+            # GIF tidak punya mp4 di struktur ini -> pakai URL langsungnya
+            if video.get("url"):
+                videos.append({"url": video["url"], "is_gif": True, "duration": 0})
+            continue
+        best = pick_best_twitter_variant(video.get("variants"))
+        if best:
+            videos.append({
+                "url": best["url"],
+                "width": video.get("width") or 0,
+                "height": video.get("height") or 0,
+                "duration": int(video.get("duration") or 0),
+                "is_gif": False,
+            })
+
+    photos = []
+    for photo in (media.get("photos") or []):
+        photo_url = photo.get("url")
+        if not photo_url:
+            continue
+        # ?name=small -> versi resolusi asli
+        if re.search(r'[?&]name=', photo_url):
+            photo_url = re.sub(r'([?&])name=[A-Za-z0-9]+', r'\1name=orig', photo_url)
+        else:
+            photo_url += ('&' if '?' in photo_url else '?') + 'name=orig'
+        photos.append(photo_url)
+
+    return {
+        "id": tweet_id,
+        "author": (tweet.get("author") or {}).get("screen_name") or "",
+        "text": (tweet.get("text") or "").strip(),
+        "created_at": tweet.get("created_at") or "",
+        "videos": videos,
+        "photos": photos,
+    }
+
+
+
+# ==========================================
 # TELEGRAM BOT HANDLERS
 # ==========================================
 
 @client.on(events.NewMessage(pattern=r'^/(start|help)'))
 async def start_handler(event):
     welcome_text = (
-        "👋 **Selamat datang di TikTok & Facebook Downloader Bot!**\n\n"
-        "Kirimkan link TikTok atau Facebook/Reels ke sini, "
+        "👋 **Selamat datang di TikTok, Facebook & X Downloader Bot!**\n\n"
+        "Kirimkan link TikTok, Facebook/Reels, atau X/Twitter ke sini, "
         "dan saya akan mengunduh serta mengirimkannya tanpa watermark.\n\n"
         "📌 **Format yang didukung:**\n"
         "• `https://vt.tiktok.com/...`\n"
@@ -586,7 +689,9 @@ async def start_handler(event):
         "• `https://www.tiktok.com/@user/photo/...`\n"
         "• `https://www.facebook.com/reel/...`\n"
         "• `https://www.facebook.com/share/r/...`\n"
-        "• `https://fb.watch/...`\n\n"
+        "• `https://fb.watch/...`\n"
+        "• `https://x.com/user/status/...`\n"
+        "• `https://twitter.com/user/status/...`\n\n"
         "_Silakan tempel (paste) link-nya sekarang!_"
     )
     await event.reply(welcome_text)
@@ -735,11 +840,142 @@ async def handle_facebook_message(event, status_msg, fb_url):
                     pass
 
 
+async def handle_twitter_message(event, status_msg, tweet_url, tweet_id):
+    """Download media tweet (video/GIF/foto) lalu kirim ke Telegram."""
+    created_files = []
+    try:
+        data = await asyncio.to_thread(fetch_twitter_media_info, tweet_id)
+
+        if data and data.get("error") == "notfound":
+            await status_msg.edit(
+                "❌ **Tweet-nya nggak ketemu.**\n"
+                "Bisa jadi sudah dihapus, akun dikunci, atau tweet-nya privat."
+            )
+            return
+
+        if not data:
+            await status_msg.edit(
+                "❌ **Gagal mengambil media dari link X/Twitter tersebut.**\n"
+                "Coba lagi beberapa saat atau pakai link tweet lain."
+            )
+            return
+
+        videos = data.get("videos") or []
+        photos = data.get("photos") or []
+        caption_head = f"@{data['author']}" if data.get("author") else "X"
+
+        if not videos and not photos:
+            teks = (data.get("text") or "").strip()
+            await status_msg.edit(
+                f"ℹ️ **Tweet ini nggak ada video/fotonya.**\n\n"
+                f"{teks[:600] if teks else '(tanpa teks)'}"
+            )
+            return
+
+        # Video / GIF
+        if videos:
+            for idx, video in enumerate(videos[:4], start=1):
+                await status_msg.edit(
+                    f"⬇ **Mendownload video {idx}/{min(len(videos), 4)}...**"
+                )
+                suffix = "mp4"
+                video_path = os.path.join(TEMP_DIR, f"x_{tweet_id}_{event.id}_{idx}.{suffix}")
+                created_files.append(video_path)
+
+                ok = await asyncio.to_thread(
+                    download_binary, video["url"], video_path, "https://x.com/"
+                )
+                if not ok or not os.path.exists(video_path) or os.path.getsize(video_path) == 0:
+                    await status_msg.edit("❌ **Gagal mendownload file video dari server X.**")
+                    return
+
+                await status_msg.edit("⬆ **Sedang mengunggah video ke Telegram...**")
+
+                duration, width, height = await asyncio.to_thread(get_video_metadata, video_path)
+                thumb_path = await asyncio.to_thread(generate_thumbnail, video_path)
+                if thumb_path:
+                    created_files.append(thumb_path)
+
+                attributes = []
+                if duration or width or height:
+                    attributes.append(DocumentAttributeVideo(
+                        duration=duration,
+                        w=width,
+                        h=height,
+                        supports_streaming=True
+                    ))
+
+                caption = f"🎬 **Video dari {caption_head}**\n🔗 [Link tweet]({tweet_url})"
+                if len(videos) > 1:
+                    caption += f"\n({idx}/{len(videos)})"
+
+                await client.send_file(
+                    event.chat_id,
+                    file=video_path,
+                    caption=caption,
+                    thumb=thumb_path,
+                    attributes=attributes,
+                    reply_to=event.message.id
+                )
+
+            await status_msg.delete()
+            return
+
+        # Foto (maks 10 per album Telegram)
+        photos = photos[:10]
+        await status_msg.edit(f"⬇ **Mendownload {len(photos)} foto...**")
+        img_paths = []
+        for idx, photo_url in enumerate(photos, start=1):
+            img_path = os.path.join(TEMP_DIR, f"x_{tweet_id}_{event.id}_{idx}.jpg")
+            created_files.append(img_path)
+            ok = await asyncio.to_thread(download_binary, photo_url, img_path, "https://x.com/")
+            if ok and os.path.exists(img_path) and os.path.getsize(img_path) > 0:
+                img_paths.append(img_path)
+
+        if not img_paths:
+            await status_msg.edit("❌ **Gagal mendownload foto dari server X.**")
+            return
+
+        await status_msg.edit(f"⬆ **Mengunggah {len(img_paths)} foto ke Telegram...**")
+        await client.send_file(
+            event.chat_id,
+            file=img_paths,
+            caption=f"🖼 **Foto dari {caption_head}**\n🔗 [Link tweet]({tweet_url})",
+            reply_to=event.message.id
+        )
+        await status_msg.delete()
+
+    except Exception as e:
+        print(f"Error handling X/Twitter message: {e}")
+        try:
+            await status_msg.edit(f"❌ **Terjadi kesalahan:** {e}")
+        except Exception:
+            pass
+
+    finally:
+        for fpath in created_files:
+            if os.path.exists(fpath):
+                try:
+                    os.remove(fpath)
+                except Exception:
+                    pass
+
+
 @client.on(events.NewMessage)
 async def message_handler(event):
     text = event.raw_text.strip()
     if text.startswith("/"):
         return
+
+    # Link X / Twitter
+    tw_match = re.search(TWITTER_URL_PATTERN, text)
+    if tw_match:
+        tweet_url = tw_match.group(0).rstrip('.,)')
+        tweet_id = extract_tweet_id(tweet_url)
+        if tweet_id:
+            status_msg = await event.reply("⏳ **Sedang memproses link X/Twitter...**")
+            await handle_twitter_message(event, status_msg, tweet_url, tweet_id)
+            return
 
     # Link Facebook / Reels
     fb_match = re.search(FACEBOOK_URL_PATTERN, text)
@@ -883,7 +1119,7 @@ async def start_bot():
 
     me = await client.get_me()
     print("=" * 45)
-    print("🤖 TIKTOK & FACEBOOK DOWNLOADER TELEGRAM BOT")
+    print("🤖 TIKTOK, FACEBOOK & X DOWNLOADER TELEGRAM BOT")
     print(f"✅ Bot Berhasil Berjalan!")
     print(f"   Nama    : {me.first_name}")
     print(f"   Username: @{me.username}")
@@ -891,7 +1127,7 @@ async def start_bot():
     cookie_file = get_facebook_cookie_file()
     print(f"   Cookie FB: {'ada (' + os.path.basename(cookie_file) + ')' if cookie_file else 'nggak ada'}")
     print("=" * 45)
-    print("Menunggu pesan link TikTok / Facebook... (Ctrl+C untuk stop)")
+    print("Menunggu pesan link TikTok / Facebook / X... (Ctrl+C untuk stop)")
 
     await client.run_until_disconnected()
 

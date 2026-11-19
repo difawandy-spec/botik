@@ -9,6 +9,7 @@ Bot Telegram buat ngunduh video/foto TikTok sama video Facebook/Reels, terus dik
 | TikTok | Video tanpa watermark, foto/carousel | scrape endpoint web TikTok (`fetch_tiktok_media_info`) |
 | Facebook | Reels, video, link share (`/share/r/...`, `/share/v/...`), `fb.watch` | scrape [getmyfb.com](https://getmyfb.com) → link `ssscdn.io` (HD 720p, fallback SD 360p); kalau getmyfb diblok (sering di IP datacenter), otomatis fallback ke **yt-dlp** |
 | Facebook foto | Postingan foto tunggal & carousel (`/share/p/...`) | getmyfb cuma kasih placeholder, jadi foto diambil langsung dari HTML postingan (og:image + semua `scontent.../t39.30808-6/`, param `ctp` dibuang biar resolusi asli). Kalau FB ngeblok IP server, fallback ke UA bot (`TelegramBot (like TwitterBot)`) yang biasanya lolos login wall — dapatnya foto pertama saja |
+| X / Twitter | Video, GIF, foto (maks 4 video / 10 foto per tweet) | `api.fxtwitter.com/status/<id>` → pilih variant MP4 bitrate tertinggi; foto dikirim album dengan `?name=orig` biar resolusi penuh |
 
 - Deteksi link otomatis dari teks pesan (boleh ada teks lain di sekitarnya).
 - Link profil Facebook diabaikan biar bot nggak nyahut di grup.
