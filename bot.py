@@ -633,34 +633,66 @@ def fetch_twitter_media_info(tweet_id):
         return {"error": "notfound"}
 
     media = tweet.get("media") or {}
-    videos = []
-    for video in media.get("videos") or []:
-        if video.get("type") == "gif":
-            # GIF tidak punya mp4 di struktur ini -> pakai URL langsungnya
-            if video.get("url"):
-                videos.append({"url": video["url"], "is_gif": True, "duration": 0})
-            continue
-        best = pick_best_twitter_variant(video.get("variants"))
-        if best:
-            videos.append({
-                "url": best["url"],
-                "width": video.get("width") or 0,
-                "height": video.get("height") or 0,
-                "duration": int(video.get("duration") or 0),
-                "is_gif": False,
-            })
 
-    photos = []
-    for photo in (media.get("photos") or []):
-        photo_url = photo.get("url")
+    def _norm_photo_url(photo_url):
         if not photo_url:
-            continue
-        # ?name=small -> versi resolusi asli
+            return None
         if re.search(r'[?&]name=', photo_url):
-            photo_url = re.sub(r'([?&])name=[A-Za-z0-9]+', r'\1name=orig', photo_url)
-        else:
-            photo_url += ('&' if '?' in photo_url else '?') + 'name=orig'
-        photos.append(photo_url)
+            return re.sub(r'([?&])name=[A-Za-z0-9]+', r'\1name=orig', photo_url)
+        return photo_url + ('&' if '?' in photo_url else '?') + 'name=orig'
+
+    def _video_item(video):
+        if not isinstance(video, dict):
+            return None
+        if video.get("type") == "gif":
+            gif_url = video.get("url")
+            if not gif_url:
+                return None
+            return {"kind": "video", "url": gif_url, "is_gif": True, "duration": 0, "width": 0, "height": 0}
+        best = pick_best_twitter_variant(video.get("variants"))
+        if not best:
+            return None
+        return {
+            "kind": "video",
+            "url": best["url"],
+            "width": video.get("width") or 0,
+            "height": video.get("height") or 0,
+            "duration": int(video.get("duration") or 0),
+            "is_gif": False,
+        }
+
+    # Pakai media.all kalau ada supaya urutan campuran (video+foto) ikut urutan tweet.
+    raw_items = media.get("all")
+    if not isinstance(raw_items, list) or not raw_items:
+        raw_items = []
+        for v in (media.get("videos") or []):
+            raw_items.append(v)
+        for p in (media.get("photos") or []):
+            raw_items.append({"type": "photo", **p} if isinstance(p, dict) else p)
+
+    items = []
+    seen_urls = set()
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            continue
+        mtype = raw.get("type")
+        item = None
+        if mtype in ("video", "gif"):
+            item = _video_item(raw)
+        elif mtype == "photo":
+            purl = _norm_photo_url(raw.get("url"))
+            if purl:
+                item = {"kind": "photo", "url": purl}
+        if not item:
+            continue
+        url = item.get("url")
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        items.append(item)
+
+    videos = [i for i in items if i["kind"] == "video"]
+    photos = [i["url"] for i in items if i["kind"] == "photo"]
 
     return {
         "id": tweet_id,
@@ -669,6 +701,7 @@ def fetch_twitter_media_info(tweet_id):
         "created_at": tweet.get("created_at") or "",
         "videos": videos,
         "photos": photos,
+        "items": items,
     }
 
 
@@ -860,11 +893,10 @@ async def handle_twitter_message(event, status_msg, tweet_url, tweet_id):
             )
             return
 
-        videos = data.get("videos") or []
-        photos = data.get("photos") or []
+        items = data.get("items") or []
         caption_head = f"@{data['author']}" if data.get("author") else "X"
 
-        if not videos and not photos:
+        if not items:
             teks = (data.get("text") or "").strip()
             await status_msg.edit(
                 f"ℹ️ **Tweet ini nggak ada video/fotonya.**\n\n"
@@ -872,18 +904,27 @@ async def handle_twitter_message(event, status_msg, tweet_url, tweet_id):
             )
             return
 
-        # Video / GIF
-        if videos:
-            for idx, video in enumerate(videos[:4], start=1):
+        videos = [i for i in items if i.get("kind") == "video"]
+        photos = [i for i in items if i.get("kind") == "photo"]
+        total = len(items)
+        sent_any = False
+        video_idx = 0
+        photo_paths = []
+        photo_count = len(photos[:10])
+
+        for idx, item in enumerate(items, start=1):
+            kind = item.get("kind")
+
+            if kind == "video":
+                video_idx += 1
                 await status_msg.edit(
-                    f"⬇ **Mendownload video {idx}/{min(len(videos), 4)}...**"
+                    f"⬇ **Mendownload video {video_idx}/{len(videos)}...**"
                 )
-                suffix = "mp4"
-                video_path = os.path.join(TEMP_DIR, f"x_{tweet_id}_{event.id}_{idx}.{suffix}")
+                video_path = os.path.join(TEMP_DIR, f"x_{tweet_id}_{event.id}_{idx}.mp4")
                 created_files.append(video_path)
 
                 ok = await asyncio.to_thread(
-                    download_binary, video["url"], video_path, "https://x.com/"
+                    download_binary, item["url"], video_path, "https://x.com/"
                 )
                 if not ok or not os.path.exists(video_path) or os.path.getsize(video_path) == 0:
                     await status_msg.edit("❌ **Gagal mendownload file video dari server X.**")
@@ -892,6 +933,13 @@ async def handle_twitter_message(event, status_msg, tweet_url, tweet_id):
                 await status_msg.edit("⬆ **Sedang mengunggah video ke Telegram...**")
 
                 duration, width, height = await asyncio.to_thread(get_video_metadata, video_path)
+                if not duration and item.get("duration"):
+                    duration = int(item["duration"])
+                if not width and item.get("width"):
+                    width = int(item["width"])
+                if not height and item.get("height"):
+                    height = int(item["height"])
+
                 thumb_path = await asyncio.to_thread(generate_thumbnail, video_path)
                 if thumb_path:
                     created_files.append(thumb_path)
@@ -905,9 +953,10 @@ async def handle_twitter_message(event, status_msg, tweet_url, tweet_id):
                         supports_streaming=True
                     ))
 
-                caption = f"🎬 **Video dari {caption_head}**\n🔗 [Link tweet]({tweet_url})"
-                if len(videos) > 1:
-                    caption += f"\n({idx}/{len(videos)})"
+                label = "GIF" if item.get("is_gif") else "Video"
+                caption = f"🎬 **{label} dari {caption_head}**\n🔗 [Link tweet]({tweet_url})"
+                if total > 1:
+                    caption += f"\n({idx}/{total})"
 
                 await client.send_file(
                     event.chat_id,
@@ -917,32 +966,35 @@ async def handle_twitter_message(event, status_msg, tweet_url, tweet_id):
                     attributes=attributes,
                     reply_to=event.message.id
                 )
+                sent_any = True
 
-            await status_msg.delete()
+            elif kind == "photo":
+                if len(photo_paths) >= 10:
+                    continue
+                pidx = len(photo_paths) + 1
+                await status_msg.edit(f"⬇ **Mendownload foto {pidx}/{photo_count}...**")
+                img_path = os.path.join(TEMP_DIR, f"x_{tweet_id}_{event.id}_{idx}.jpg")
+                created_files.append(img_path)
+                ok = await asyncio.to_thread(download_binary, item["url"], img_path, "https://x.com/")
+                if ok and os.path.exists(img_path) and os.path.getsize(img_path) > 0:
+                    photo_paths.append(img_path)
+                else:
+                    print(f"gagal download foto X: {item.get('url')}")
+
+        if photo_paths:
+            await status_msg.edit(f"⬆ **Mengunggah {len(photo_paths)} foto ke Telegram...**")
+            await client.send_file(
+                event.chat_id,
+                file=photo_paths,
+                caption=f"🖼 **Foto dari {caption_head}**\n🔗 [Link tweet]({tweet_url})",
+                reply_to=event.message.id
+            )
+            sent_any = True
+
+        if not sent_any:
+            await status_msg.edit("❌ **Gagal mendownload media dari server X.**")
             return
 
-        # Foto (maks 10 per album Telegram)
-        photos = photos[:10]
-        await status_msg.edit(f"⬇ **Mendownload {len(photos)} foto...**")
-        img_paths = []
-        for idx, photo_url in enumerate(photos, start=1):
-            img_path = os.path.join(TEMP_DIR, f"x_{tweet_id}_{event.id}_{idx}.jpg")
-            created_files.append(img_path)
-            ok = await asyncio.to_thread(download_binary, photo_url, img_path, "https://x.com/")
-            if ok and os.path.exists(img_path) and os.path.getsize(img_path) > 0:
-                img_paths.append(img_path)
-
-        if not img_paths:
-            await status_msg.edit("❌ **Gagal mendownload foto dari server X.**")
-            return
-
-        await status_msg.edit(f"⬆ **Mengunggah {len(img_paths)} foto ke Telegram...**")
-        await client.send_file(
-            event.chat_id,
-            file=img_paths,
-            caption=f"🖼 **Foto dari {caption_head}**\n🔗 [Link tweet]({tweet_url})",
-            reply_to=event.message.id
-        )
         await status_msg.delete()
 
     except Exception as e:
